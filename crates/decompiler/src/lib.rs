@@ -215,10 +215,12 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
             &Opcode::JAlways { offset } => {
                 if offset < 0 {
                     // It's either the jump backward of a loop or a continue statement
-                    let loop_start = state
-                        .scopes
-                        .last_loop_start()
-                        .expect("Backward jump but we aren't in a loop ?");
+                    let Some(loop_start) = state.scopes.last_loop_start() else {
+                        state.push_stmt(Statement::Comment(
+                            "decompile error: backward jump but not in a loop".into(),
+                        ));
+                        continue;
+                    };
 
                     // Scan the next instructions in order to find another jump to the same place
                     if f.ops.iter().enumerate().skip(i + 1).find_map(|(j, o)| {
@@ -237,7 +239,9 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                         if let Some(stmt) = state.scopes.end_last_loop() {
                             state.push_stmt(stmt);
                         } else {
-                            panic!("Last scope is not a loop !");
+                            state.push_stmt(Statement::Comment(
+                                "decompile error: Last scope is not a loop".into(),
+                            ));
                         }
                     }
                 } else {
@@ -245,7 +249,9 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                         if let Some(pos) = offsets.iter().position(|o| *o == i) {
                             state.scopes.push_switch_case(pos);
                         } else {
-                            panic!("no matching offset for switch case ({i})");
+                            state.push_stmt(Statement::Comment(
+                                format!("decompile error: no matching offset for switch case ({i})"),
+                            ));
                         }
                     } else if state.scopes.last_loop_start().is_some() {
                         // Check the instruction just before the jump target

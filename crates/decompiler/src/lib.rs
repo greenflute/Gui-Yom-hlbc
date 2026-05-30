@@ -5,6 +5,58 @@
 
 use std::collections::{HashMap, HashSet};
 
+/// Max AST node count for an inlined expression. Prevents O(n²) clone cost from
+/// deeply chained expression inlining in large functions.
+const MAX_INLINE_SIZE: usize = 50;
+
+/// Returns true if `e` has more than `remaining` nodes (short-circuits early).
+fn expr_exceeds_size(e: &Expr, remaining: &mut usize) -> bool {
+    if *remaining == 0 {
+        return true;
+    }
+    *remaining -= 1;
+    match e {
+        Expr::Constant(_) | Expr::FunRef(_) | Expr::Unknown(_) | Expr::Variable(_, _) => false,
+        Expr::Closure(_, _) => false,
+        Expr::Array(a, b) => {
+            expr_exceeds_size(a, remaining) || expr_exceeds_size(b, remaining)
+        }
+        Expr::Call(call) => {
+            expr_exceeds_size(&call.fun, remaining)
+                || call.args.iter().any(|a| expr_exceeds_size(a, remaining))
+        }
+        Expr::Constructor(c) => c.args.iter().any(|a| expr_exceeds_size(a, remaining)),
+        Expr::EnumConstr(_, _, args) => args.iter().any(|a| expr_exceeds_size(a, remaining)),
+        Expr::Field(obj, _) => expr_exceeds_size(obj, remaining),
+        Expr::IfElse { cond, .. } => expr_exceeds_size(cond, remaining),
+        Expr::Anonymous(_, fields) => fields.values().any(|v| expr_exceeds_size(v, remaining)),
+        Expr::Op(op) => match op {
+            Operation::Add(a, b)
+            | Operation::Sub(a, b)
+            | Operation::Mul(a, b)
+            | Operation::Div(a, b)
+            | Operation::Mod(a, b)
+            | Operation::Shl(a, b)
+            | Operation::Shr(a, b)
+            | Operation::And(a, b)
+            | Operation::Or(a, b)
+            | Operation::Xor(a, b)
+            | Operation::Eq(a, b)
+            | Operation::NotEq(a, b)
+            | Operation::Gt(a, b)
+            | Operation::Gte(a, b)
+            | Operation::Lt(a, b)
+            | Operation::Lte(a, b) => {
+                expr_exceeds_size(a, remaining) || expr_exceeds_size(b, remaining)
+            }
+            Operation::Neg(a)
+            | Operation::Not(a)
+            | Operation::Incr(a)
+            | Operation::Decr(a) => expr_exceeds_size(a, remaining),
+        },
+    }
+}
+
 use ast::*;
 use hlbc::fmt::EnhancedFmt;
 use hlbc::opcodes::Opcode;
@@ -89,9 +141,23 @@ impl<'c> DecompilerState<'c> {
     // Update the register state and create a statement depending on inline rules
     fn push_expr(&mut self, i: usize, dst: Reg, expr: Expr) {
         let name = self.f.var_name(self.code, i);
-        // Inline check
         if name.is_none() {
-            self.reg_state.insert(dst, expr);
+            // Inline only if the expression is small enough to avoid O(n²) clone cost.
+            let mut limit = MAX_INLINE_SIZE;
+            if !expr_exceeds_size(&expr, &mut limit) {
+                self.reg_state.insert(dst, expr);
+                return;
+            }
+            // Expression too large: materialize as a synthetic variable so future
+            // uses only clone a cheap Variable node instead of the whole tree.
+            let syn: Option<Str> = Some(Str::from(format!("_r{}", dst.0)));
+            self.reg_state.insert(dst, Expr::Variable(dst, syn.clone()));
+            let declaration = self.seen.insert(syn.clone().unwrap());
+            self.push_stmt(Statement::Assign {
+                declaration,
+                variable: Expr::Variable(dst, syn),
+                assign: expr,
+            });
         } else {
             self.reg_state
                 .insert(dst, Expr::Variable(dst, name.clone()));

@@ -179,6 +179,19 @@ impl<'c> DecompilerState<'c> {
 pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
     let mut state = DecompilerState::new(code, f);
 
+    // Precompute backward JAlways targets to avoid O(n²) scan at each backward jump.
+    // Maps loop_start -> sorted list of positions that jump back to it.
+    let mut backward_jumps_by_target: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (j, op) in f.ops.iter().enumerate() {
+        if let Opcode::JAlways { offset } = op {
+            if *offset < 0 {
+                let target = (j as i32 + offset + 1) as usize;
+                backward_jumps_by_target.entry(target).or_default().push(j);
+            }
+        }
+    }
+
     let iter = f.ops.iter().enumerate();
     for (i, o) in iter {
         // Opcodes are grouped by semantic
@@ -222,15 +235,12 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                         continue;
                     };
 
-                    // Scan the next instructions in order to find another jump to the same place
-                    if f.ops.iter().enumerate().skip(i + 1).find_map(|(j, o)| {
-                        // We found another jump to the same place !
-                        if matches!(o, Opcode::JAlways {offset} if (j as i32 + offset + 1) as usize == loop_start) {
-                            Some(true)
-                        } else {
-                            None
-                        }
-                    }).unwrap_or(false) {
+                    // Check (in O(1)) whether a later backward jump targets the same loop_start.
+                    if backward_jumps_by_target
+                        .get(&loop_start)
+                        .map(|positions| positions.iter().any(|&p| p > i))
+                        .unwrap_or(false)
+                    {
                         // If this jump is not the last jump backward for the current loop, so it's definitely a continue; statement
                         state.push_stmt(Statement::Continue);
                     } else {

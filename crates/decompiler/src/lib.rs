@@ -533,20 +533,25 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 }
             }
             Opcode::CallThis { dst, field, args } => {
-                let method = f.regs[0].method(field.0, code).unwrap();
-                let call = call(
-                    Expr::Field(Box::new(cst_this()), method.name(code)),
-                    state.args_expr(args),
-                );
-                if method
-                    .findex
-                    .as_fn(code)
-                    .map(|fun| fun.ty(code).ret.is_void())
-                    .unwrap_or(false)
-                {
-                    state.push_stmt(stmt(call));
+                if let Some(method) = f.regs[0].method(field.0, code) {
+                    let call = call(
+                        Expr::Field(Box::new(cst_this()), method.name(code)),
+                        state.args_expr(args),
+                    );
+                    if method
+                        .findex
+                        .as_fn(code)
+                        .map(|fun| fun.ty(code).ret.is_void())
+                        .unwrap_or(false)
+                    {
+                        state.push_stmt(stmt(call));
+                    } else {
+                        state.push_expr(i, *dst, call);
+                    }
                 } else {
-                    state.push_expr(i, *dst, call);
+                    state.push_stmt(Statement::Comment(
+                        format!("decompile error: CallThis field {} out of bounds", field.0),
+                    ));
                 }
             }
             Opcode::CallClosure { dst, fun, args } => {
@@ -569,11 +574,15 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                     "closure : {}",
                     fun.display::<EnhancedFmt>(code)
                 )));
-                state.push_expr(
-                    i,
-                    dst,
-                    Expr::Closure(fun, decompile_code(code, fun.as_fn(code).unwrap())),
-                );
+                if let Some(f_inner) = fun.as_fn(code) {
+                    state.push_expr(
+                        i,
+                        dst,
+                        Expr::Closure(fun, decompile_code(code, f_inner)),
+                    );
+                } else {
+                    state.push_expr(i, dst, Expr::Unknown(format!("native closure {}", fun.display::<EnhancedFmt>(code))));
+                }
             }
             &Opcode::InstanceClosure { dst, obj, fun } => {
                 state.push_stmt(comment(format!(
@@ -583,11 +592,15 @@ pub fn decompile_code(code: &Bytecode, f: &Function) -> Vec<Statement> {
                 match &code[f[obj]] {
                     // This is an anonymous enum holding the capture for the closure
                     Type::Enum { .. } => {
-                        state.push_expr(
-                            i,
-                            dst,
-                            Expr::Closure(fun, decompile_code(code, fun.as_fn(code).unwrap())),
-                        );
+                        if let Some(f_inner) = fun.as_fn(code) {
+                            state.push_expr(
+                                i,
+                                dst,
+                                Expr::Closure(fun, decompile_code(code, f_inner)),
+                            );
+                        } else {
+                            state.push_expr(i, dst, Expr::Unknown(format!("native closure {}", fun.display::<EnhancedFmt>(code))));
+                        }
                     }
                     _ => {
                         state.push_expr(
@@ -915,30 +928,36 @@ pub fn decompile_class(code: &Bytecode, obj: &TypeObj) -> Class {
 
     let mut methods = Vec::new();
     for fun in obj.bindings.values() {
-        methods.push(Method {
-            fun: *fun,
-            static_: false,
-            dynamic: true,
-            statements: decompile_code(code, fun.as_fn(code).unwrap()),
-        })
-    }
-    if let Some(ty) = static_type {
-        for fun in ty.bindings.values() {
+        if let Some(f_inner) = fun.as_fn(code) {
             methods.push(Method {
                 fun: *fun,
-                static_: true,
-                dynamic: false,
-                statements: decompile_code(code, fun.as_fn(code).unwrap()),
+                static_: false,
+                dynamic: true,
+                statements: decompile_code(code, f_inner),
             })
         }
     }
+    if let Some(ty) = static_type {
+        for fun in ty.bindings.values() {
+            if let Some(f_inner) = fun.as_fn(code) {
+                methods.push(Method {
+                    fun: *fun,
+                    static_: true,
+                    dynamic: false,
+                    statements: decompile_code(code, f_inner),
+                })
+            }
+        }
+    }
     for f in &obj.protos {
-        methods.push(Method {
-            fun: f.findex,
-            static_: false,
-            dynamic: false,
-            statements: decompile_code(code, f.findex.as_fn(code).unwrap()),
-        })
+        if let Some(f_inner) = f.findex.as_fn(code) {
+            methods.push(Method {
+                fun: f.findex,
+                static_: false,
+                dynamic: false,
+                statements: decompile_code(code, f_inner),
+            })
+        }
     }
 
     Class {
